@@ -1,8 +1,8 @@
 # Implementation Plan
 
-## Completed
+## Completed (v1.0)
 
-Core dispatcher with multiprocessing task distribution:
+### Core Dispatcher
 - BaseWorker abstraction with setup/process/cleanup lifecycle
 - Protocol messages (TaskSuccess, TaskError, TaskTimeout, SetupFailed, CleanupFailed)
 - Automatic backpressure control via bounded queues
@@ -11,302 +11,121 @@ Core dispatcher with multiprocessing task distribution:
 - Comprehensive test suite (13 tests)
 - Packaging setup (pyproject.toml, installable via pip)
 
-## Next: UI Extension
+### UI Extension
+- RichDispatcher wrapper with live progress display
+- Protocol messages extended with worker_id
+- Callback signatures updated (task_id, result/error, worker_id)
+- on_exit callback for cleanup
+- Rich dependency integration
+- Overall progress panel and per-GPU status table
+- Threading architecture (main thread for UI, background for dispatcher)
+- Thread-safe statistics tracking
 
-Add a high-level UI wrapper with rich progress display while maintaining the core dispatcher's simplicity.
+### Graceful Shutdown
+- Signal handling (SIGINT/SIGTERM) for clean Ctrl+C exit
+- shutdown() method on Dispatcher
+- Graceful worker termination with fallback to terminate/kill
+- Queue draining and resource cleanup
+- Timeout-based blocking operations to allow interruption
 
-## Naming
+## TODO: Next Steps
 
-Use `ui` module instead of `extras` (clearer intent).
+### 1. Debug Mode (High Priority)
 
-```
-gpu_dispatch/
-├── ui/
-│   ├── __init__.py
-│   └── rich_dispatcher.py
-```
+**Problem**: When developing workers, errors may occur and output needs to be visible. Current UI hides worker stdout/stderr which makes debugging difficult.
 
-## Dependencies
+**Solution**: Replace `show_ui` flag with `debug` mode.
 
-Add `rich` as a default dependency (not optional):
-
-```toml
-dependencies = ["rich>=13.0"]
-```
-
-Users get it automatically with `pip install git+https://...`
-
-## Core Changes (Breaking)
-
-### 1. Protocol Messages - Add worker_id
-
-All task-related messages include worker_id:
-
-```python
-@dataclass
-class TaskSuccess:
-    task_id: int
-    data: Any
-    worker_id: int
-
-@dataclass
-class TaskError:
-    task_id: int
-    error: str
-    worker_id: int
-
-@dataclass
-class TaskTimeout:
-    task_id: int
-    timeout: float
-    worker_id: int
-```
-
-### 2. Worker - Pass gpu_id to messages
-
-Modify `_worker_main` to include `gpu_id` in all result messages.
-
-### 3. Callbacks - Add worker_id parameter
-
-New callback signatures:
-
-```python
-on_success(task_id: int, result: Any, worker_id: int)
-on_error(task_id: int, error: str, worker_id: int)
-on_timeout(task_id: int, timeout: float, worker_id: int)
-```
-
-### 4. New Callback - on_exit
-
-Add optional `on_exit` callback to `Dispatcher.run()`:
-
-```python
-def run(
-    self,
-    generator: Iterator[Any],
-    on_success: Callable[[int, Any, int], None],
-    on_error: Callable[[int, str, int], None] | None = None,
-    on_timeout: Callable[[int, float, int], None] | None = None,
-    on_setup_fail: Callable[[int, str], None] | None = None,
-    on_exit: Callable[[], None] | None = None,  # NEW - no parameters
-    base_seed: int = 42,
-    task_timeout: float | None = None,
-    **setup_kwargs,
-) -> None:
-```
-
-Called in finally block:
-
-```python
-finally:
-    if on_exit:
-        on_exit()  # User can do cleanup, save results, etc.
-
-    # Cleanup workers
-    ...
-```
-
-User maintains their own state via closures/class methods, no need to pass stats.
-
-## RichDispatcher Implementation
-
-### API
-
-```python
-from gpu_dispatch.ui import RichDispatcher
-
-dispatcher = RichDispatcher(
-    worker_cls=MyWorker,
-    gpu_ids=[0, 1, 2, 3],
-    queue_size=512,
-    show_ui=True,          # Can disable for logging/non-interactive
-    refresh_rate=2.0,      # UI updates per second
-)
-
-stats = dispatcher.run(
-    generator=my_generator(),
-    on_success=custom_success_handler,  # Optional, receives (task_id, result, worker_id)
-    on_error=custom_error_handler,      # Optional
-    on_timeout=custom_timeout_handler,  # Optional
-    model_path="./model.pth",
-)
-
-# Returns final statistics
-print(f"Completed: {stats['completed']}")
-```
-
-### Internal Architecture
-
-**Composition over inheritance**:
-- Wraps core `Dispatcher`
-- Maintains internal statistics
-- Provides callback wrappers that:
-  1. Update UI state
-  2. Call user's custom callback (if provided)
-
-**Threading**:
-- Main thread: Rich Live display
-- Background thread: Dispatcher.run()
-- Thread-safe state updates with Lock
-
-**State tracking**:
-```python
-self._stats = {
-    'total': 0,
-    'completed': 0,
-    'failed': 0,
-    'timeout': 0,
-    'start_time': None,
-    'gpu_status': {
-        gpu_id: {
-            'status': 'initializing',  # idle, processing, finished, error
-            'current_task': None,
-            'task_start_time': None,
-            'completed': 0,
-            'failed': 0,
-            'timeout': 0,
-        }
-        for gpu_id in gpu_ids
-    }
-}
-```
-
-### UI Components
-
-**Overall Progress Panel**:
-```
-┌─ Overall Progress ───────────────────────────┐
-│ Progress: 847/1000 (✓ 820 ✗ 15 ⏱ 12)       │
-│ Elapsed: 0:12:34 │ ETA: 0:02:15            │
-└──────────────────────────────────────────────┘
-```
-
-**GPU Status Table**:
-```
-┌─ GPU Status ─────────────────────────────────────────────┐
-│ GPU │ Status      │ Current │ Completed │ Failed │ Time │
-├─────┼─────────────┼─────────┼───────────┼────────┼──────┤
-│  0  │ Processing  │  #1523  │    210    │   3    │ 2.1s │
-│  1  │ Processing  │  #1524  │    208    │   4    │ 1.8s │
-│  2  │ Idle        │    -    │    205    │   2    │  -   │
-│  3  │ Processing  │  #1525  │    207    │   6    │ 0.9s │
-└─────┴─────────────┴─────────┴───────────┴────────┴──────┘
-```
-
-**Status colors**:
-- Processing: Yellow
-- Idle: Green
-- Initializing: Blue
-- Finished: Bold Green
-- Error: Bold Red
-
-### GPU Status Detection
-
-Track GPU status transitions:
-- `initializing` → first message from worker
-- `idle` → after completing a task (before getting next)
-- `processing` → when task starts
-- `finished` → when worker exits
-- `error` → when setup fails
-
-Use worker_id from messages to update correct GPU status.
-
-### User Callback Integration
-
-```python
-def _wrap_success_callback(self, user_callback):
-    def wrapper(task_id, result, worker_id):
-        with self._lock:
-            # Update UI state
-            self._stats['completed'] += 1
-            self._stats['gpu_status'][worker_id]['completed'] += 1
-            self._stats['gpu_status'][worker_id]['status'] = 'idle'
-            self._stats['gpu_status'][worker_id]['current_task'] = None
-
-        # Call user callback
-        if user_callback:
-            user_callback(task_id, result, worker_id)
-
-    return wrapper
-```
-
-## Implementation Steps
-
-1. Add type annotations to Dispatcher.run()
-2. Update core protocol (add worker_id)
-3. Update worker._worker_main (pass gpu_id to messages)
-4. Update dispatcher callbacks (add worker_id parameter, add on_exit)
-5. Add rich to dependencies
-6. Implement RichDispatcher
-7. Write examples
-8. Update tests (new callback signatures)
-9. Update design.md
-10. Update README.md
-
-## Examples
-
-### Basic Rich UI
-```python
-from gpu_dispatch.ui import RichDispatcher
-
-dispatcher = RichDispatcher(
-    worker_cls=MyWorker,
-    gpu_ids=[0, 1, 2, 3],
-)
-
-stats = dispatcher.run(
-    generator=data_generator(),
-    model_path="./model.pth",
-)
-```
-
-### With Custom Callbacks
-```python
-results = []
-
-def save_result(task_id, result, worker_id):
-    results.append(result)
-
-def handle_error(task_id, error, worker_id):
-    logging.error(f"Task {task_id} on GPU {worker_id}: {error}")
-
-def on_exit():
-    print(f"Finished! Processed {len(results)} items")
-    save_to_disk(results)
-
-dispatcher = RichDispatcher(
-    worker_cls=MyWorker,
-    gpu_ids=[0, 1, 2, 3],
-)
-
-stats = dispatcher.run(
-    generator=data_generator(),
-    on_success=save_result,
-    on_error=handle_error,
-    on_exit=on_exit,
-    model_path="./model.pth",
-)
-```
-
-### No UI (just statistics)
+**API Design**:
 ```python
 dispatcher = RichDispatcher(
     worker_cls=MyWorker,
     gpu_ids=[0, 1, 2, 3],
-    show_ui=False,  # Disable UI, still track stats
+    debug=False,  # Default: production mode with UI
 )
-
-stats = dispatcher.run(...)
-print(f"Success rate: {stats['completed']/stats['total']*100:.1f}%")
 ```
 
-## Design Decisions
+**Debug Mode Behavior** (when `debug=True`):
+1. **No Rich UI** - to avoid interference with worker output
+2. **Redirect worker stdout/stderr** - capture and display all worker output in main process
+3. **Fail fast** - stop immediately on first error (instead of continuing)
+4. **Detailed error reporting** - print full tracebacks with context
 
-### On-exit callback
+**Normal Mode Behavior** (when `debug=False`):
+1. **Show Rich UI** - live progress display
+2. **Suppress worker output** - keep UI clean
+3. **Continue on error** - process remaining tasks
+4. **Summary error reporting** - errors in callback, not stdout
 
-Add `on_exit` callback to `Dispatcher.run()`:
+**Implementation Details**:
+- Use `sys.stdout`/`sys.stderr` redirection in worker processes
+- In debug mode, use a shared Queue to collect worker outputs
+- Main process reads from output queue and prints to terminal
+- Add `fail_fast` flag to stop dispatcher on first error
+
+### 2. Code Complexity Review (High Priority)
+
+**Current Issues**:
+- Shutdown logic is complex (signal handlers, events, timeouts, terminate/kill)
+- Multiple layers: Dispatcher → RichDispatcher → threading → multiprocessing
+- Queue management and draining is intricate
+- Error handling paths are hard to follow
+
+**Goals**:
+- Reduce complexity while maintaining functionality
+- Make shutdown logic more understandable
+- Simplify the interaction between threading and multiprocessing
+- Consider if some features can be simplified or removed
+
+**Questions to Address**:
+1. Can we simplify the shutdown event propagation?
+2. Is the feeder thread necessary or can it be eliminated?
+3. Can we reduce the number of queues/events/locks?
+4. Is there a simpler architecture that achieves the same goals?
+5. Should RichDispatcher directly use multiprocessing instead of wrapping Dispatcher?
+
+**Approach**:
+- Document current architecture and control flow
+- Identify pain points and unnecessary complexity
+- Propose alternative designs
+- Discuss trade-offs (complexity vs features)
+- Implement chosen design
+
+### 3. Testing and Validation (Medium Priority)
+
+**Items**:
+- Test graceful shutdown (Ctrl+C handling)
+- Test debug mode output redirection
+- Test fail-fast behavior in debug mode
+- Stress test with many workers and tasks
+- Test edge cases (all workers fail, empty generator, etc.)
+
+### 4. Documentation (Medium Priority)
+
+**Items**:
+- Update README with debug mode usage
+- Document shutdown behavior
+- Add troubleshooting guide
+- API reference documentation
+- Architecture diagram
+
+## Design Decisions Log
+
+### Completed Decisions
+
+**On-exit callback**:
 - Called in finally block (guaranteed execution)
 - No parameters - user maintains state themselves via closures
 - Executes on both normal completion and interruption
-- Useful for cleanup, final logging, saving state
-- Reliable because it's in the finally block of dispatcher.run()
+
+**Shutdown method over parameter**:
+- Added `shutdown()` method to Dispatcher
+- Cleaner API than passing _shutdown_event parameter
+- Allows external control if needed
+
+### Pending Decisions
+
+**Debug vs show_ui**:
+- Leaning towards `debug` mode that bundles multiple behaviors
+- More intuitive for users than separate flags
+- Needs implementation and user feedback
