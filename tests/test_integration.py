@@ -37,10 +37,10 @@ def test_large_dataset_single_gpu():
     results = []
     errors = []
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         results.append(data)
 
-    def on_error(task_id, error):
+    def on_error(task_id, error, worker_id):
         errors.append((task_id, error))
 
     dispatcher = Dispatcher(
@@ -79,7 +79,7 @@ def test_large_dataset_multi_gpu():
     results = []
     gpu_usage = {0: 0, 1: 0, 2: 0, 3: 0}
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         results.append(data)
         gpu_usage[data["gpu"]] += 1
 
@@ -180,10 +180,10 @@ def test_error_recovery():
     successes = []
     errors = []
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         successes.append(task_id)
 
-    def on_error(task_id, error):
+    def on_error(task_id, error, worker_id):
         errors.append(task_id)
 
     dispatcher = Dispatcher(
@@ -223,10 +223,10 @@ def test_mixed_timeout_and_success():
     successes = []
     timeouts = []
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         successes.append(task_id)
 
-    def on_timeout(task_id, timeout_val):
+    def on_timeout(task_id, timeout_val, worker_id):
         timeouts.append(task_id)
 
     dispatcher = Dispatcher(
@@ -267,7 +267,7 @@ def test_generator_with_state():
     gen = StatefulGenerator()
     results = []
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         results.append(data)
 
     dispatcher = Dispatcher(
@@ -294,7 +294,7 @@ def test_callback_ordering():
 
     callback_order = []
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         callback_order.append(task_id)
 
     dispatcher = Dispatcher(

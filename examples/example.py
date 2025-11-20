@@ -1,4 +1,5 @@
 from gpu_dispatch import BaseWorker, Dispatcher
+from gpu_dispatch.ui import RichDispatcher
 import time
 
 
@@ -11,7 +12,7 @@ class SimpleInferenceWorker(BaseWorker):
         print(f"[GPU {gpu_id}] Ready!")
 
     def process(self, data: str) -> dict:
-        time.sleep(0.01)
+        time.sleep(0.1)
         return {
             "input": data,
             "gpu": self.gpu_id,
@@ -26,14 +27,13 @@ def data_generator():
     for i in range(50):
         yield f"data_{i:03d}"
 
-
-def main():
+def run_core_dispatcher():
     results = []
 
-    def on_success(task_id, result):
+    def on_success(task_id, result, worker_id):
         results.append(result)
         if task_id % 10 == 0:
-            print(f"Completed task {task_id}")
+            print(f"[core] Completed task {task_id} on GPU {worker_id}")
 
     dispatcher = Dispatcher(
         worker_cls=SimpleInferenceWorker,
@@ -56,5 +56,31 @@ def main():
         print(f"  {i}: {result}")
 
 
+def run_rich_dispatcher():
+    def on_success(task_id, result, worker_id):
+        if task_id % 15 == 0:
+            print(f"[rich] Completed {task_id} on GPU {worker_id}")
+
+    rich_dispatcher = RichDispatcher(
+        worker_cls=SimpleInferenceWorker,
+        gpu_ids=[0, 1],
+        queue_size=32,
+        refresh_rate=4.0,
+    )
+
+    stats = rich_dispatcher.run(
+        generator=data_generator(),
+        on_success=on_success,
+        model_name="example_model",
+    )
+
+    print("\nRich dispatcher stats:")
+    print(f"  Completed: {stats['completed']}")
+    print(f"  Failed: {stats['failed']}")
+    for gpu_id, gpu_stats in stats["gpu_status"].items():
+        print(f"  GPU {gpu_id}: {gpu_stats['completed']} tasks, status={gpu_stats['status']}")
+
+
 if __name__ == "__main__":
-    main()
+    run_core_dispatcher()
+    run_rich_dispatcher()

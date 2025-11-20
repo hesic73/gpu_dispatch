@@ -4,7 +4,7 @@ import traceback
 from typing import Any
 from multiprocessing import Queue
 
-from gpu_dispatch.protocol import TaskSuccess, TaskError, TaskTimeout, SetupFailed, CleanupFailed
+from gpu_dispatch.protocol import TaskSuccess, TaskError, TaskTimeout, TaskStarted, SetupFailed, CleanupFailed
 
 
 class BaseWorker(abc.ABC):
@@ -61,23 +61,24 @@ def _worker_main(
                 alarm_seconds = max(1, int(task_timeout + 0.5))
                 signal.alarm(alarm_seconds)
 
+            result_queue.put(TaskStarted(task_id=task_id, worker_id=gpu_id))
             result = worker_instance.process(data)
 
             if task_timeout is not None:
                 signal.alarm(0)
 
-            result_queue.put(TaskSuccess(task_id=task_id, data=result))
+            result_queue.put(TaskSuccess(task_id=task_id, data=result, worker_id=gpu_id))
 
         except TimeoutError:
             if task_timeout is not None:
                 signal.alarm(0)
-            result_queue.put(TaskTimeout(task_id=task_id, timeout=task_timeout))
+            result_queue.put(TaskTimeout(task_id=task_id, timeout=task_timeout, worker_id=gpu_id))
 
         except Exception:
             if task_timeout is not None:
                 signal.alarm(0)
             error_msg = traceback.format_exc()
-            result_queue.put(TaskError(task_id=task_id, error=error_msg))
+            result_queue.put(TaskError(task_id=task_id, error=error_msg, worker_id=gpu_id))
 
     # Cleanup
     try:

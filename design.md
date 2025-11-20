@@ -37,6 +37,15 @@ graph LR
     M -- dispatch --> CB[User Callbacks]
 ```
 
+## 6. Rich UI Dispatcher
+
+`gpu_dispatch.ui.RichDispatcher` composes the same worker pool with a live terminal UI powered by Rich:
+
+- **Live dashboard** – Overall panel lists totals, elapsed time, throughput; GPU table tracks per-device status, last task, and timing with color-coded statuses (`processing`, `idle`, `initializing`, `finished`, `error`).
+- **Threaded execution** – Dispatcher work runs in a background thread so the main thread can refresh the UI at the requested `refresh_rate`. When `show_ui=False`, it behaves like a pure wrapper that still records statistics.
+- **Enhanced callbacks** – Internal wrappers update shared metrics/state before invoking user callbacks, leveraging the `TaskStarted` signal for precise per-GPU tracking and an `on_exit` hook for deterministic cleanup.
+- **Structured stats** – `run()` returns a dictionary snapshot (`total`, `completed`, `failed`, `timeouts`, per-GPU counters, start/end times), making it easy to log or analyze runs outside the UI.
+
 ### Key Components
 
 * **Feeder (Producer)**: A background thread in the main process. It iterates through the user's generator and pushes tasks into the `Task Queue`. It pauses (blocks) if the queue is full, creating natural **backpressure**.
@@ -58,34 +67,37 @@ from dataclasses import dataclass
 from typing import Any
 
 @dataclass
-
 class TaskSuccess:
     task_id: int
     data: Any       # The return value from worker.process()
+    worker_id: int  # GPU/worker identifier
 
 @dataclass
-
 class TaskError:
     task_id: int
     error: str      # Traceback string (Runtime failures)
+    worker_id: int
 
 @dataclass
-
 class SetupFailed:
     gpu_id: int
     error: str      # Traceback string (Initialization failures)
 
 @dataclass
-
 class CleanupFailed:
     gpu_id: int
     error: str      # Traceback string (Resource release failures)
 
 @dataclass
-
 class TaskTimeout:
     task_id: int
     timeout: float  # The timeout duration that was exceeded
+    worker_id: int
+
+@dataclass
+class TaskStarted:
+    task_id: int
+    worker_id: int  # Fired when a worker begins processing
 ```
 
 
@@ -150,21 +162,25 @@ class Dispatcher:
 
     def run(self,
             generator,
-            on_success: callable,
-            on_error: callable = None,
-            on_timeout: callable = None,
-            on_setup_fail: callable = None,
+            on_success: callable,          # (task_id, result, worker_id)
+            on_error: callable = None,     # (task_id, error, worker_id)
+            on_timeout: callable = None,   # (task_id, timeout, worker_id)
+            on_setup_fail: callable = None,# (gpu_id, error)
+            on_task_start: callable = None,# (task_id, worker_id)
+            on_exit: callable = None,      # ()
             base_seed: int = 42,
-            task_timeout: float = None,
+            task_timeout: float | None = None,
             **setup_kwargs):
         """
         Starts the pipeline and blocks until the generator is exhausted.
 
         :param generator: Iterator yielding task data (e.g., file paths).
-        :param on_success: Callback function(task_id, result).
-        :param on_error: Callback function(task_id, error) for task failures.
-        :param on_timeout: Callback function(task_id, timeout) for task timeouts.
+        :param on_success: Callback function(task_id, result, worker_id).
+        :param on_error: Callback function(task_id, error, worker_id) for task failures.
+        :param on_timeout: Callback function(task_id, timeout, worker_id) for task timeouts.
         :param on_setup_fail: Callback function(gpu_id, error) for setup failures.
+        :param on_task_start: Callback function(task_id, worker_id) fired before processing begins.
+        :param on_exit: Callback triggered once all workers drain (cleanup hook).
         :param base_seed: Base random seed for workers.
         :param task_timeout: Maximum seconds per task. None = no timeout.
         :param setup_kwargs: Arguments passed to worker.setup() (e.g., model_path).
@@ -209,15 +225,15 @@ def path_generator():
         yield f"/data/img_{i:04d}.jpg"
 
 # --- 3. Define Callbacks ---
-def on_result(task_id, data):
+def on_result(task_id, data, worker_id):
     if task_id % 100 == 0:
-        print(f"Progress: {task_id} -> {data}")
+        print(f"Progress: {task_id} on GPU {worker_id} -> {data}")
 
-def on_failure(task_id, error):
-    print(f"Task {task_id} Failed: {error}")
+def on_failure(task_id, error, worker_id):
+    print(f"Task {task_id} Failed on GPU {worker_id}: {error}")
 
-def on_timeout_handler(task_id, timeout):
-    print(f"Task {task_id} timed out after {timeout}s")
+def on_timeout_handler(task_id, timeout, worker_id):
+    print(f"Task {task_id} on GPU {worker_id} timed out after {timeout}s")
 
 # --- 4. Run Pipeline ---
 if __name__ == "__main__":
@@ -245,4 +261,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nStopped by user.")
 ```
-

@@ -1,9 +1,16 @@
 import multiprocessing as mp
 import threading
-from typing import Iterator, Callable, Any
+from typing import Any, Callable, Iterable
 
 from gpu_dispatch.worker import BaseWorker, _worker_main
-from gpu_dispatch.protocol import TaskSuccess, TaskError, TaskTimeout, SetupFailed, CleanupFailed
+from gpu_dispatch.protocol import TaskSuccess, TaskError, TaskTimeout, TaskStarted, SetupFailed, CleanupFailed
+
+SuccessCallback = Callable[[int, Any, int], None]
+ErrorCallback = Callable[[int, str, int], None]
+TimeoutCallback = Callable[[int, float, int], None]
+SetupFailCallback = Callable[[int, str], None]
+StartCallback = Callable[[int, int], None]
+ExitCallback = Callable[[], None]
 
 
 class Dispatcher:
@@ -27,11 +34,13 @@ class Dispatcher:
 
     def run(
         self,
-        generator: Iterator[Any],
-        on_success: Callable[[int, Any], None],
-        on_error: Callable[[int, str], None] | None = None,
-        on_timeout: Callable[[int, float], None] | None = None,
-        on_setup_fail: Callable[[int, str], None] | None = None,
+        generator: Iterable[Any],
+        on_success: SuccessCallback,
+        on_error: ErrorCallback | None = None,
+        on_timeout: TimeoutCallback | None = None,
+        on_setup_fail: SetupFailCallback | None = None,
+        on_task_start: StartCallback | None = None,
+        on_exit: ExitCallback | None = None,
         base_seed: int = 42,
         task_timeout: float | None = None,
         **setup_kwargs,
@@ -78,8 +87,12 @@ class Dispatcher:
                 on_error=on_error,
                 on_timeout=on_timeout,
                 on_setup_fail=on_setup_fail,
+                on_task_start=on_task_start,
             )
         finally:
+            if on_exit:
+                on_exit()
+
             for _ in self.gpu_ids:
                 task_queue.put(None)
 
@@ -88,7 +101,7 @@ class Dispatcher:
 
     def _feeder(
         self,
-        generator: Iterator[Any],
+        generator: Iterable[Any],
         task_queue: mp.Queue,
         stop_event: threading.Event,
         task_count: list,
@@ -111,10 +124,11 @@ class Dispatcher:
         feeder_stop: threading.Event,
         feeder_thread: threading.Thread,
         task_count: list,
-        on_success: Callable[[int, Any], None],
-        on_error: Callable[[int, str], None] | None,
-        on_timeout: Callable[[int, float], None] | None,
-        on_setup_fail: Callable[[int, str], None] | None,
+        on_success: SuccessCallback,
+        on_error: ErrorCallback | None,
+        on_timeout: TimeoutCallback | None,
+        on_setup_fail: SetupFailCallback | None,
+        on_task_start: StartCallback | None,
     ) -> None:
         active_workers = len(self.gpu_ids)
         results_received = 0
@@ -127,18 +141,23 @@ class Dispatcher:
                 result = result_queue.get(timeout=0.1)
             except:
                 continue
+            if isinstance(result, TaskStarted):
+                if on_task_start:
+                    on_task_start(result.task_id, result.worker_id)
+                continue
+
             if isinstance(result, TaskSuccess):
-                on_success(result.task_id, result.data)
+                on_success(result.task_id, result.data, result.worker_id)
                 results_received += 1
 
             elif isinstance(result, TaskError):
                 if on_error:
-                    on_error(result.task_id, result.error)
+                    on_error(result.task_id, result.error, result.worker_id)
                 results_received += 1
 
             elif isinstance(result, TaskTimeout):
                 if on_timeout:
-                    on_timeout(result.task_id, result.timeout)
+                    on_timeout(result.task_id, result.timeout, result.worker_id)
                 results_received += 1
 
             elif isinstance(result, SetupFailed):

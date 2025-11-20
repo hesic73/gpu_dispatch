@@ -1,6 +1,7 @@
 import time
 import pytest
 from gpu_dispatch import BaseWorker, Dispatcher
+from gpu_dispatch.ui import RichDispatcher
 
 
 class SimpleWorker(BaseWorker):
@@ -67,8 +68,8 @@ def test_basic_pipeline():
 
     results = []
 
-    def on_success(task_id, data):
-        results.append((task_id, data))
+    def on_success(task_id, data, worker_id):
+        results.append((task_id, data, worker_id))
 
     dispatcher = Dispatcher(
         worker_cls=SimpleWorker,
@@ -85,8 +86,9 @@ def test_basic_pipeline():
     # Verify all tasks completed
     assert len(results) == 10
     # Verify results are correct (doubled)
-    for task_id, data in results:
+    for task_id, data, worker_id in results:
         assert data == task_id * 2
+        assert worker_id == 0
 
 
 def test_multiple_workers():
@@ -97,7 +99,7 @@ def test_multiple_workers():
 
     results = []
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         results.append((task_id, data))
 
     dispatcher = Dispatcher(
@@ -128,10 +130,10 @@ def test_task_error_handling():
     successes = []
     errors = []
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         successes.append(task_id)
 
-    def on_error(task_id, error):
+    def on_error(task_id, error, worker_id):
         errors.append(task_id)
 
     dispatcher = Dispatcher(
@@ -160,7 +162,7 @@ def test_setup_failure():
 
     setup_failures = []
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         pytest.fail("Should not succeed if setup fails")
 
     def on_setup_fail(gpu_id, error):
@@ -197,10 +199,10 @@ def test_timeout():
     successes = []
     timeouts = []
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         successes.append(task_id)
 
-    def on_timeout(task_id, timeout_val):
+    def on_timeout(task_id, timeout_val, worker_id):
         timeouts.append(task_id)
 
     dispatcher = Dispatcher(
@@ -230,7 +232,7 @@ def test_backpressure():
 
     results = []
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         results.append(task_id)
 
     dispatcher = Dispatcher(
@@ -257,7 +259,7 @@ def test_empty_generator():
 
     results = []
 
-    def on_success(task_id, data):
+    def on_success(task_id, data, worker_id):
         results.append(task_id)
 
     dispatcher = Dispatcher(
@@ -272,3 +274,137 @@ def test_empty_generator():
     )
 
     assert len(results) == 0
+
+
+def test_on_exit_callback():
+    """Verify the Dispatcher invokes on_exit exactly once."""
+    def generator():
+        for i in range(4):
+            yield i
+
+    exit_called = []
+
+    def on_success(task_id, data, worker_id):
+        pass
+
+    def on_exit():
+        exit_called.append(True)
+
+    dispatcher = Dispatcher(
+        worker_cls=SimpleWorker,
+        gpu_ids=[0],
+        queue_size=8,
+    )
+
+    dispatcher.run(
+        generator=generator(),
+        on_success=on_success,
+        on_exit=on_exit,
+        multiplier=1,
+    )
+
+    assert exit_called == [True]
+
+
+def test_on_task_start_callback():
+    """Ensure task-start notifications track worker IDs."""
+    total_tasks = 20
+
+    def generator():
+        for i in range(total_tasks):
+            yield i
+
+    start_events = []
+
+    def on_success(task_id, data, worker_id):
+        pass
+
+    def on_task_start(task_id, worker_id):
+        start_events.append((task_id, worker_id))
+
+    dispatcher = Dispatcher(
+        worker_cls=SimpleWorker,
+        gpu_ids=[0, 1],
+        queue_size=16,
+    )
+
+    dispatcher.run(
+        generator=generator(),
+        on_success=on_success,
+        on_task_start=on_task_start,
+        multiplier=1,
+    )
+
+    assert len(start_events) == total_tasks
+    assert sorted(task_id for task_id, _ in start_events) == list(range(total_tasks))
+    assert {worker_id for _, worker_id in start_events}.issubset({0, 1})
+
+
+def test_rich_dispatcher_stats_no_ui():
+    """RichDispatcher should gather stats even when UI is disabled."""
+    total_tasks = 12
+
+    def generator():
+        for i in range(total_tasks):
+            yield i
+
+    collected = []
+
+    def on_success(task_id, data, worker_id):
+        collected.append(worker_id)
+
+    rich_dispatcher = RichDispatcher(
+        worker_cls=SimpleWorker,
+        gpu_ids=[0, 1],
+        queue_size=16,
+        show_ui=False,
+    )
+
+    stats = rich_dispatcher.run(
+        generator=generator(),
+        on_success=on_success,
+        multiplier=2,
+    )
+
+    assert len(collected) == total_tasks
+    assert stats["completed"] == total_tasks
+    assert stats["total"] == total_tasks
+    for gpu_id in [0, 1]:
+        assert stats["gpu_status"][gpu_id]["status"] == "finished"
+        assert stats["gpu_status"][gpu_id]["completed"] >= 1
+
+
+def test_rich_dispatcher_propagates_callbacks():
+    """User callbacks should still run when using the Rich UI wrapper."""
+    total_tasks = 6
+
+    def generator():
+        for i in range(total_tasks):
+            yield i
+
+    task_starts = []
+    successes = []
+
+    def on_success(task_id, data, worker_id):
+        successes.append((task_id, worker_id))
+
+    def on_task_start(task_id, worker_id):
+        task_starts.append((task_id, worker_id))
+
+    rich_dispatcher = RichDispatcher(
+        worker_cls=SimpleWorker,
+        gpu_ids=[0],
+        queue_size=8,
+        show_ui=False,
+    )
+
+    rich_dispatcher.run(
+        generator=generator(),
+        on_success=on_success,
+        on_task_start=on_task_start,
+        multiplier=1,
+    )
+
+    assert len(successes) == total_tasks
+    assert len(task_starts) == total_tasks
+    assert [task for task, _ in successes] == list(range(total_tasks))
