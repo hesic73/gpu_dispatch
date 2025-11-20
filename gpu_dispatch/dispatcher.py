@@ -124,40 +124,11 @@ class Dispatcher:
             if on_exit:
                 on_exit()
 
-            # Signal shutdown to all components
+            # Shutdown sequence
             shutdown_event.set()
             feeder_stop.set()
-
-            # Send stop sentinels to workers with timeout
-            for _ in self.gpu_ids:
-                try:
-                    task_queue.put(None, timeout=0.5)
-                except Full:
-                    pass
-
-            # Wait for workers to exit gracefully
-            for p in processes:
-                p.join(timeout=3.0)
-
-            # Terminate workers that didn't exit
-            for p in processes:
-                if p.is_alive():
-                    p.terminate()
-                    p.join(timeout=1.0)
-
-            # Force kill if still alive
-            for p in processes:
-                if p.is_alive():
-                    p.kill()
-                    p.join(timeout=0.5)
-
-            # Drain and close queues to prevent resource warnings
-            self._drain_queue(task_queue)
-            self._drain_queue(result_queue)
-            task_queue.close()
-            result_queue.close()
-            task_queue.join_thread()
-            result_queue.join_thread()
+            self._shutdown_workers(processes, task_queue)
+            self._cleanup_queues(task_queue, result_queue)
 
     def _feeder(
         self,
@@ -196,6 +167,40 @@ class Dispatcher:
                 queue.get_nowait()
         except Empty:
             pass
+
+    def _shutdown_workers(self, processes: list, task_queue: mp.Queue) -> None:
+        """Shutdown worker processes with escalating force (graceful → terminate → kill)."""
+        # Send stop sentinels
+        for _ in self.gpu_ids:
+            try:
+                task_queue.put(None, timeout=0.5)
+            except Full:
+                pass
+
+        # Wait for graceful exit
+        for p in processes:
+            p.join(timeout=3.0)
+
+        # Terminate stragglers
+        for p in processes:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=1.0)
+
+        # Force kill if needed
+        for p in processes:
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=0.5)
+
+    def _cleanup_queues(self, task_queue: mp.Queue, result_queue: mp.Queue) -> None:
+        """Drain and close queues to prevent resource warnings."""
+        self._drain_queue(task_queue)
+        self._drain_queue(result_queue)
+        task_queue.close()
+        result_queue.close()
+        task_queue.join_thread()
+        result_queue.join_thread()
 
     def _monitor(
         self,

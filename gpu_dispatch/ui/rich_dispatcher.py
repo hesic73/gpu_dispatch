@@ -162,44 +162,27 @@ class RichDispatcher:
 
         return wrapper
 
-    def _wrap_success_callback(self, user_callback: SuccessCallback | None) -> SuccessCallback:
-        def wrapper(task_id: int, result: Any, worker_id: int) -> None:
+    def _wrap_task_result_callback(self, user_callback, stat_name: str):
+        """Generic wrapper for success/error/timeout callbacks (reduces duplication)."""
+        def wrapper(task_id: int, data: Any, worker_id: int) -> None:
             with self._lock:
-                self._stats["completed"] += 1
+                self._stats[stat_name] += 1
                 self._stats["total"] += 1
                 worker_stats = self._stats["gpu_status"][worker_id]
-                worker_stats["completed"] += 1
+                worker_stats[stat_name] += 1
                 self._finalize_task(worker_stats)
             if user_callback:
-                user_callback(task_id, result, worker_id)
-
+                user_callback(task_id, data, worker_id)
         return wrapper
+
+    def _wrap_success_callback(self, user_callback: SuccessCallback | None) -> SuccessCallback:
+        return self._wrap_task_result_callback(user_callback, "completed")
 
     def _wrap_error_callback(self, user_callback: ErrorCallback | None) -> ErrorCallback:
-        def wrapper(task_id: int, error: str, worker_id: int) -> None:
-            with self._lock:
-                self._stats["failed"] += 1
-                self._stats["total"] += 1
-                worker_stats = self._stats["gpu_status"][worker_id]
-                worker_stats["failed"] += 1
-                self._finalize_task(worker_stats)
-            if user_callback:
-                user_callback(task_id, error, worker_id)
-
-        return wrapper
+        return self._wrap_task_result_callback(user_callback, "failed")
 
     def _wrap_timeout_callback(self, user_callback: TimeoutCallback | None) -> TimeoutCallback:
-        def wrapper(task_id: int, timeout: float, worker_id: int) -> None:
-            with self._lock:
-                self._stats["timeouts"] += 1
-                self._stats["total"] += 1
-                worker_stats = self._stats["gpu_status"][worker_id]
-                worker_stats["timeouts"] += 1
-                self._finalize_task(worker_stats)
-            if user_callback:
-                user_callback(task_id, timeout, worker_id)
-
-        return wrapper
+        return self._wrap_task_result_callback(user_callback, "timeouts")
 
     def _wrap_setup_fail_callback(self, user_callback: SetupFailCallback | None) -> SetupFailCallback:
         def wrapper(gpu_id: int, error: str) -> None:
