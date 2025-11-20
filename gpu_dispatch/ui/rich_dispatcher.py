@@ -67,6 +67,7 @@ class RichDispatcher:
         on_exit: ExitCallback | None = None,
         base_seed: int = 42,
         task_timeout: float | None = None,
+        total_tasks: int | None = None,
         **setup_kwargs,
     ) -> dict[str, Any]:
         """Execute the dispatcher and optionally display a live UI."""
@@ -74,6 +75,7 @@ class RichDispatcher:
         self._stop_event = threading.Event()
         self._exception = None
         self._stats["start_time"] = time.perf_counter()
+        self._stats["expected_total"] = total_tasks
 
         # Signal handler to stop the dispatcher
         def signal_handler(signum, frame):
@@ -95,6 +97,7 @@ class RichDispatcher:
                 self._wrap_exit_callback(on_exit),
                 base_seed,
                 task_timeout,
+                total_tasks,
                 setup_kwargs,
             ),
             daemon=False,
@@ -134,6 +137,7 @@ class RichDispatcher:
         on_exit: ExitCallback | None,
         base_seed: int,
         task_timeout: float | None,
+        total_tasks: int | None,
         setup_kwargs: dict[str, Any],
     ) -> None:
         try:
@@ -147,6 +151,7 @@ class RichDispatcher:
                 on_exit=on_exit,
                 base_seed=base_seed,
                 task_timeout=task_timeout,
+                total_tasks=total_tasks,
                 **setup_kwargs,
             )
         except BaseException as exc:  # Surface worker failures back to caller
@@ -249,6 +254,7 @@ class RichDispatcher:
         failed = stats["failed"]
         timeouts = stats["timeouts"]
         total = stats["total"]
+        expected_total = stats.get("expected_total")
 
         now = time.perf_counter()
         start_time = stats["start_time"]
@@ -262,10 +268,30 @@ class RichDispatcher:
         if elapsed and elapsed > 0 and total > 0:
             throughput = f"{total / elapsed:.1f} tasks/s"
 
+        # Build progress line
+        if expected_total is not None:
+            percentage = (total / expected_total * 100) if expected_total > 0 else 0
+            progress_line = f"Progress: {total}/{expected_total} ({percentage:.1f}%)"
+        else:
+            progress_line = f"Progress: {total}/?"
+
         lines = [
+            progress_line,
             f"Processed: {total} (✓ {completed} ✗ {failed} ⏱ {timeouts})",
-            f"Elapsed: {self._format_elapsed(elapsed)} | Throughput: {throughput}",
         ]
+
+        # Add ETA if we have expected_total
+        if expected_total is not None and elapsed and elapsed > 0 and total > 0:
+            remaining = expected_total - total
+            if remaining > 0:
+                avg_time_per_task = elapsed / total
+                eta_seconds = remaining * avg_time_per_task
+                lines.append(f"Elapsed: {self._format_elapsed(elapsed)} | ETA: {self._format_elapsed(eta_seconds)} | Throughput: {throughput}")
+            else:
+                lines.append(f"Elapsed: {self._format_elapsed(elapsed)} | Throughput: {throughput}")
+        else:
+            lines.append(f"Elapsed: {self._format_elapsed(elapsed)} | Throughput: {throughput}")
+
         return Panel("\n".join(lines), title="Overall Progress", border_style="cyan")
 
     def _build_gpu_table(self, stats: dict[str, Any]) -> Table:
@@ -334,6 +360,7 @@ class RichDispatcher:
             "setup_failures": 0,
             "start_time": None,
             "end_time": None,
+            "expected_total": None,
             "gpu_status": {
                 gpu_id: {
                     "status": "initializing",

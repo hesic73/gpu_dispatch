@@ -82,6 +82,7 @@ class Dispatcher:
         on_exit: ExitCallback | None = None,
         base_seed: int = 42,
         task_timeout: float | None = None,
+        total_tasks: int | None = None,
         **setup_kwargs,
     ) -> None:
         task_queue = self.ctx.Queue(maxsize=self.queue_size)
@@ -144,6 +145,7 @@ class Dispatcher:
                 on_setup_fail=on_setup_fail,
                 on_task_start=on_task_start,
                 shutdown_event=shutdown_event,
+                total_tasks=total_tasks,
             )
         except KeyboardInterrupt:
             shutdown_event.set()
@@ -246,6 +248,7 @@ class Dispatcher:
         on_setup_fail: SetupFailCallback | None,
         on_task_start: StartCallback | None,
         shutdown_event,
+        total_tasks: int | None,
     ) -> None:
         active_workers = len(self.gpu_ids)
         results_received = 0
