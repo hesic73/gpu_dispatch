@@ -34,11 +34,17 @@ class RichDispatcher:
         show_ui: bool = True,
         refresh_rate: float = 2.0,
         console: Console | None = None,
+        suppress_worker_output: bool = True,
     ) -> None:
         if refresh_rate <= 0:
             raise ValueError("refresh_rate must be positive")
 
-        self._dispatcher = Dispatcher(worker_cls=worker_cls, gpu_ids=gpu_ids, queue_size=queue_size)
+        self._dispatcher = Dispatcher(
+            worker_cls=worker_cls,
+            gpu_ids=gpu_ids,
+            queue_size=queue_size,
+            suppress_worker_output=suppress_worker_output,
+        )
         self._gpu_ids = gpu_ids
         self._show_ui = show_ui
         self._refresh_rate = refresh_rate

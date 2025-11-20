@@ -1,5 +1,7 @@
 import multiprocessing as mp
+import os
 import signal
+import sys
 import threading
 from queue import Empty, Full
 from typing import Any, Callable, Iterable
@@ -15,12 +17,40 @@ StartCallback = Callable[[int, int], None]
 ExitCallback = Callable[[], None]
 
 
+def _worker_main_silenced(*args, **kwargs):
+    """Wrapper that suppresses worker stdout/stderr to keep UI clean."""
+    # Redirect stdout and stderr at the file descriptor level
+    # This catches everything including loguru and direct writes
+    devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    old_stdout_fd = os.dup(1)
+    old_stderr_fd = os.dup(2)
+
+    try:
+        # Redirect file descriptors
+        os.dup2(devnull_fd, 1)  # stdout
+        os.dup2(devnull_fd, 2)  # stderr
+
+        # Also redirect Python-level streams
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
+
+        _worker_main(*args, **kwargs)
+    finally:
+        # Restore original file descriptors
+        os.dup2(old_stdout_fd, 1)
+        os.dup2(old_stderr_fd, 2)
+        os.close(old_stdout_fd)
+        os.close(old_stderr_fd)
+        os.close(devnull_fd)
+
+
 class Dispatcher:
     def __init__(
         self,
         worker_cls: type[BaseWorker],
         gpu_ids: list[int],
         queue_size: int = 1024,
+        suppress_worker_output: bool = False,
     ):
         if not issubclass(worker_cls, BaseWorker):
             raise TypeError(f"worker_cls must inherit from BaseWorker, got {worker_cls}")
@@ -31,6 +61,7 @@ class Dispatcher:
         self.worker_cls = worker_cls
         self.gpu_ids = gpu_ids
         self.queue_size = queue_size
+        self.suppress_worker_output = suppress_worker_output
 
         self.ctx = mp.get_context('spawn')
         self._shutdown_event = None
@@ -71,12 +102,13 @@ class Dispatcher:
             original_sigterm = signal.signal(signal.SIGTERM, signal_handler)
 
         processes = []
+        worker_target = _worker_main_silenced if self.suppress_worker_output else _worker_main
         for gpu_id in self.gpu_ids:
             worker_instance = self.worker_cls()
             seed = base_seed + gpu_id
 
             p = self.ctx.Process(
-                target=_worker_main,
+                target=worker_target,
                 args=(
                     worker_instance,
                     gpu_id,
