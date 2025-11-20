@@ -1,6 +1,7 @@
 import abc
 import signal
 import traceback
+from queue import Empty
 from typing import Any
 from multiprocessing import Queue
 
@@ -35,6 +36,7 @@ def _worker_main(
     result_queue: Queue,
     task_timeout: float | None,
     setup_kwargs: dict,
+    shutdown_event=None,
 ) -> None:
     # Setup
     try:
@@ -49,7 +51,15 @@ def _worker_main(
 
     # Main loop
     while True:
-        item = task_queue.get()
+        # Check for shutdown signal
+        if shutdown_event is not None and shutdown_event.is_set():
+            break
+
+        # Use timeout to allow checking shutdown_event periodically
+        try:
+            item = task_queue.get(timeout=0.5)
+        except Empty:
+            continue
 
         if item is None:
             break

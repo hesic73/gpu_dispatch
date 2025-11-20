@@ -1,5 +1,7 @@
 import multiprocessing as mp
+import signal
 import threading
+from queue import Empty, Full
 from typing import Any, Callable, Iterable
 
 from gpu_dispatch.worker import BaseWorker, _worker_main
@@ -31,6 +33,12 @@ class Dispatcher:
         self.queue_size = queue_size
 
         self.ctx = mp.get_context('spawn')
+        self._shutdown_event = None
+
+    def shutdown(self) -> None:
+        """Signal the dispatcher to shut down gracefully."""
+        if self._shutdown_event is not None:
+            self._shutdown_event.set()
 
     def run(
         self,
@@ -47,6 +55,20 @@ class Dispatcher:
     ) -> None:
         task_queue = self.ctx.Queue(maxsize=self.queue_size)
         result_queue = self.ctx.Queue()
+        self._shutdown_event = self.ctx.Event()
+        shutdown_event = self._shutdown_event
+
+        # Signal handler to set shutdown event
+        def signal_handler(signum, frame):
+            shutdown_event.set()
+
+        # Register signal handlers only in main thread
+        is_main_thread = threading.current_thread() is threading.main_thread()
+        original_sigint = None
+        original_sigterm = None
+        if is_main_thread:
+            original_sigint = signal.signal(signal.SIGINT, signal_handler)
+            original_sigterm = signal.signal(signal.SIGTERM, signal_handler)
 
         processes = []
         for gpu_id in self.gpu_ids:
@@ -63,6 +85,7 @@ class Dispatcher:
                     result_queue,
                     task_timeout,
                     setup_kwargs,
+                    shutdown_event,
                 ),
             )
             p.start()
@@ -72,7 +95,7 @@ class Dispatcher:
         task_count = [0]
         feeder_thread = threading.Thread(
             target=self._feeder,
-            args=(generator, task_queue, feeder_stop, task_count),
+            args=(generator, task_queue, feeder_stop, task_count, shutdown_event),
             daemon=True,
         )
         feeder_thread.start()
@@ -88,16 +111,53 @@ class Dispatcher:
                 on_timeout=on_timeout,
                 on_setup_fail=on_setup_fail,
                 on_task_start=on_task_start,
+                shutdown_event=shutdown_event,
             )
+        except KeyboardInterrupt:
+            shutdown_event.set()
         finally:
+            # Restore signal handlers if we registered them
+            if is_main_thread:
+                signal.signal(signal.SIGINT, original_sigint)
+                signal.signal(signal.SIGTERM, original_sigterm)
+
             if on_exit:
                 on_exit()
 
-            for _ in self.gpu_ids:
-                task_queue.put(None)
+            # Signal shutdown to all components
+            shutdown_event.set()
+            feeder_stop.set()
 
+            # Send stop sentinels to workers with timeout
+            for _ in self.gpu_ids:
+                try:
+                    task_queue.put(None, timeout=0.5)
+                except Full:
+                    pass
+
+            # Wait for workers to exit gracefully
             for p in processes:
-                p.join()
+                p.join(timeout=3.0)
+
+            # Terminate workers that didn't exit
+            for p in processes:
+                if p.is_alive():
+                    p.terminate()
+                    p.join(timeout=1.0)
+
+            # Force kill if still alive
+            for p in processes:
+                if p.is_alive():
+                    p.kill()
+                    p.join(timeout=0.5)
+
+            # Drain and close queues to prevent resource warnings
+            self._drain_queue(task_queue)
+            self._drain_queue(result_queue)
+            task_queue.close()
+            result_queue.close()
+            task_queue.join_thread()
+            result_queue.join_thread()
 
     def _feeder(
         self,
@@ -105,11 +165,22 @@ class Dispatcher:
         task_queue: mp.Queue,
         stop_event: threading.Event,
         task_count: list,
+        shutdown_event,
     ) -> None:
         task_id = 0
         try:
             for data in generator:
-                task_queue.put((task_id, data), block=True)
+                if shutdown_event.is_set():
+                    break
+                # Use timeout to allow checking shutdown_event
+                while not shutdown_event.is_set():
+                    try:
+                        task_queue.put((task_id, data), timeout=0.5)
+                        break
+                    except Full:
+                        continue
+                if shutdown_event.is_set():
+                    break
                 task_id += 1
         except Exception as e:
             # If generator fails, log and stop
@@ -117,6 +188,14 @@ class Dispatcher:
         finally:
             task_count[0] = task_id
             stop_event.set()
+
+    def _drain_queue(self, queue: mp.Queue) -> None:
+        """Drain remaining items from queue to allow clean shutdown."""
+        try:
+            while True:
+                queue.get_nowait()
+        except Empty:
+            pass
 
     def _monitor(
         self,
@@ -129,17 +208,22 @@ class Dispatcher:
         on_timeout: TimeoutCallback | None,
         on_setup_fail: SetupFailCallback | None,
         on_task_start: StartCallback | None,
+        shutdown_event,
     ) -> None:
         active_workers = len(self.gpu_ids)
         results_received = 0
 
         while True:
+            # Check for shutdown signal
+            if shutdown_event.is_set():
+                break
+
             if feeder_stop.is_set() and results_received >= task_count[0]:
                 break
 
             try:
                 result = result_queue.get(timeout=0.1)
-            except:
+            except Empty:
                 continue
             if isinstance(result, TaskStarted):
                 if on_task_start:

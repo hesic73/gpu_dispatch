@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import threading
 import time
 from copy import deepcopy
@@ -68,6 +69,14 @@ class RichDispatcher:
         self._exception = None
         self._stats["start_time"] = time.perf_counter()
 
+        # Signal handler to stop the dispatcher
+        def signal_handler(signum, frame):
+            self._dispatcher.shutdown()
+
+        # Register signal handlers in main thread
+        original_sigint = signal.signal(signal.SIGINT, signal_handler)
+        original_sigterm = signal.signal(signal.SIGTERM, signal_handler)
+
         dispatch_thread = threading.Thread(
             target=self._run_dispatcher,
             args=(
@@ -82,14 +91,26 @@ class RichDispatcher:
                 task_timeout,
                 setup_kwargs,
             ),
-            daemon=True,
+            daemon=False,
         )
         dispatch_thread.start()
 
-        if self._show_ui:
-            self._render_loop(dispatch_thread)
-        else:
-            dispatch_thread.join()
+        try:
+            if self._show_ui:
+                self._render_loop(dispatch_thread)
+            else:
+                # Wait for dispatch thread with periodic checks
+                while dispatch_thread.is_alive():
+                    dispatch_thread.join(timeout=0.5)
+        except KeyboardInterrupt:
+            self._dispatcher.shutdown()
+        finally:
+            # Restore signal handlers
+            signal.signal(signal.SIGINT, original_sigint)
+            signal.signal(signal.SIGTERM, original_sigterm)
+
+            # Wait for dispatch thread to finish cleanup
+            dispatch_thread.join(timeout=10.0)
 
         if self._exception:
             raise self._exception
