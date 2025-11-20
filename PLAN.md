@@ -1,182 +1,312 @@
-# Implementation Plan: `gpu_dispatch`
+# Implementation Plan
 
-## Project Overview
+## Completed
 
-A lightweight Python 3.10+ library for multi-GPU task orchestration using multiprocessing.
+Core dispatcher with multiprocessing task distribution:
+- BaseWorker abstraction with setup/process/cleanup lifecycle
+- Protocol messages (TaskSuccess, TaskError, TaskTimeout, SetupFailed, CleanupFailed)
+- Automatic backpressure control via bounded queues
+- Per-task timeout support (Unix/Linux, signal-based)
+- Graceful error handling and worker lifecycle management
+- Comprehensive test suite (13 tests)
+- Packaging setup (pyproject.toml, installable via pip)
 
-## Design Considerations
+## Next: UI Extension
 
-### Core Philosophy
-- **Minimal & Focused**: Core library does ONE thing well - dispatching tasks to GPU workers
-- **Extensible**: Designed to support high-level wrappers (e.g., rich progress UI) without coupling
-- **Modern Python**: Python 3.10+ only, use modern packaging (pyproject.toml)
+Add a high-level UI wrapper with rich progress display while maintaining the core dispatcher's simplicity.
 
-### Future Extension: Rich Progress UI
-The core library will be designed to support a future high-level wrapper that provides:
-- Rich text progress bars (using `rich` library)
-- Real-time task statistics
-- Worker status visualization
+## Naming
 
-**Design Implications**:
-- Callbacks should support progress tracking metadata (task_id, timing, etc.)
-- Dispatcher should expose internal state (queue sizes, worker status) via properties/methods
-- Event-driven architecture to allow wrapping without modification
+Use `ui` module instead of `extras` (clearer intent).
 
----
-
-## Implementation Tasks
-
-### Phase 1: Project Structure
 ```
 gpu_dispatch/
-├── pyproject.toml           # Modern packaging config (PEP 621)
-├── README.md                # Usage documentation
-├── .gitignore               # Python ignores
-├── gpu_dispatch/
-│   ├── __init__.py          # Public API exports
-│   ├── protocol.py          # IPC message types
-│   ├── worker.py            # BaseWorker + worker process logic
-│   └── dispatcher.py        # Dispatcher engine
-└── tests/
-    ├── __init__.py
-    ├── test_basic.py        # Unit tests (no GPU required)
-    └── test_integration.py  # Integration tests
+├── ui/
+│   ├── __init__.py
+│   └── rich_dispatcher.py
 ```
 
-### Phase 2: Core Implementation
+## Dependencies
 
-#### 2.1 Protocol (`protocol.py`)
-Define dataclasses for IPC messages:
-- `TaskSuccess(task_id, data)`
-- `TaskError(task_id, error)`
-- `TaskTimeout(task_id, timeout)` - when task exceeds timeout
-- `SetupFailed(gpu_id, error)`
-- `CleanupFailed(gpu_id, error)`
+Add `rich` as a default dependency (not optional):
 
-#### 2.2 Worker (`worker.py`)
-- `BaseWorker` abstract base class with lifecycle methods:
-  - `setup(gpu_id, seed, **kwargs)` - initialization
-  - `process(data) -> Any` - per-task execution
-  - `cleanup()` - resource release
-- `_worker_main()` function - the target for `multiprocessing.Process`
-  - Handles setup/cleanup lifecycle
-  - Main loop: consume from task queue, execute process(), send results
-  - **Timeout handling**: Uses `signal.alarm()` (Unix/Linux only) to interrupt long-running tasks
-    - Set alarm before `process()` call
-    - Clear alarm on success
-    - Catch `TimeoutError` and send `TaskTimeout` message
-
-#### 2.3 Dispatcher (`dispatcher.py`)
-- `Dispatcher` class with:
-  - `__init__(worker_cls, gpu_ids, queue_size)`
-  - `run(generator, on_success, on_error, on_timeout, on_setup_fail, task_timeout, **setup_kwargs)`
-
-**Internal Components**:
-- **Feeder Thread**: Pulls from generator → task queue (blocks on full queue)
-- **Worker Processes**: Persistent processes holding GPU context
-  - Each worker receives `task_timeout` parameter
-  - Uses signal-based timeout for task interruption
-- **Monitor Loop**: Polls result queue → invokes callbacks
-  - Routes `TaskTimeout` to `on_timeout` callback
-- **Shutdown Logic**: Graceful cleanup with poison pills
-
-**Extension Points** (for future rich UI):
-- Add optional `on_progress` callback for task lifecycle events
-- Expose `get_stats()` method returning queue sizes, completion count
-- Emit timing metadata (task start/end times) in callbacks
-
-### Phase 3: Testing
-
-#### 3.1 Unit Tests (`test_basic.py`)
-- Worker lifecycle (setup → process → cleanup)
-- Queue communication correctness
-- Error propagation (setup failures, process exceptions)
-- **Timeout mechanism** (task that sleeps longer than timeout)
-- Backpressure mechanism
-
-#### 3.2 Integration Tests (`test_integration.py`)
-- Multi-worker scenario (simulate multiple GPUs with cpu)
-- Large dataset processing (1000+ items)
-- Verify task ordering and completion
-- Resource cleanup verification
-
-### Phase 4: Packaging & Documentation
-
-#### 4.1 `pyproject.toml`
 ```toml
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
-[project]
-name = "gpu_dispatch"
-version = "0.1.0"
-requires-python = ">=3.10"
-dependencies = []
+dependencies = ["rich>=13.0"]
 ```
 
-#### 4.2 `README.md`
-- Installation instructions (`pip install git+https://...`)
-- Quick start example
-- API reference
-- Link to design.md
+Users get it automatically with `pip install git+https://...`
 
-#### 4.3 `.gitignore`
-- Python artifacts (`__pycache__`, `*.pyc`, `.pytest_cache`)
-- Build artifacts (`dist/`, `*.egg-info`)
+## Core Changes (Breaking)
 
----
+### 1. Protocol Messages - Add worker_id
 
-## Implementation Order
+All task-related messages include worker_id:
 
-1. **Project skeleton** - pyproject.toml, .gitignore, directory structure
-2. **Protocol** - Simple dataclasses, no dependencies
-3. **BaseWorker** - Abstract class definition
-4. **Worker process logic** - The actual multiprocessing target function
-5. **Dispatcher** - Main orchestration engine
-6. **Tests** - Validate correctness
-7. **Documentation** - README with examples
+```python
+@dataclass
+class TaskSuccess:
+    task_id: int
+    data: Any
+    worker_id: int
 
----
+@dataclass
+class TaskError:
+    task_id: int
+    error: str
+    worker_id: int
 
-## Key Technical Decisions
+@dataclass
+class TaskTimeout:
+    task_id: int
+    timeout: float
+    worker_id: int
+```
 
-### Multiprocessing Strategy
-- Use `multiprocessing.Queue` (not Pipe) for thread-safe, multi-consumer support
-- Use `spawn` context explicitly (compatible across platforms, especially macOS)
-- Workers are long-lived processes (not spawned per task)
+### 2. Worker - Pass gpu_id to messages
 
-### Error Handling
-- Capture full tracebacks using `traceback.format_exc()`
-- Distinguish setup errors (fatal for worker) from task errors (non-fatal)
-- Use poison pills (`None`) for graceful shutdown
+Modify `_worker_main` to include `gpu_id` in all result messages.
 
-### Backpressure
-- Feeder thread blocks on `queue.put(block=True)` when task queue is full
-- This naturally throttles generator consumption
+### 3. Callbacks - Add worker_id parameter
 
-### Timeout Mechanism
-- **Platform**: Unix/Linux only (uses `signal.SIGALRM`)
-- **Implementation**:
-  - Worker sets `signal.alarm(timeout_seconds)` before calling `process()`
-  - Signal handler raises `TimeoutError` to interrupt execution
-  - Worker catches exception and sends `TaskTimeout` message
-  - Worker continues to next task (not terminated)
-- **Graceful degradation**: If timeout is `None`, no alarm is set
-- **Limitation**: Not thread-safe within worker process (acceptable since worker is single-threaded)
+New callback signatures:
 
-### Extensibility for Rich UI
-- All callbacks receive `task_id` for tracking
-- Optional metadata can be added to protocol messages (timestamps, worker_id)
-- Dispatcher can expose `get_stats()` → `{"pending": N, "completed": M, "failed": K}`
+```python
+on_success(task_id: int, result: Any, worker_id: int)
+on_error(task_id: int, error: str, worker_id: int)
+on_timeout(task_id: int, timeout: float, worker_id: int)
+```
 
----
+### 4. New Callback - on_exit
 
-## Non-Goals (Out of Scope)
+Add optional `on_exit` callback to `Dispatcher.run()`:
 
-- GPU detection/allocation (user provides `gpu_ids`)
-- Automatic retry logic (user handles in callbacks)
-- Rich UI implementation (future separate module)
-- Task persistence or checkpointing
-- Distributed workers (single-node only)
-- Windows timeout support (signal.alarm is Unix-only; adding Windows support would require threading.Timer which adds complexity)
+```python
+def run(
+    self,
+    generator: Iterator[Any],
+    on_success: Callable[[int, Any, int], None],
+    on_error: Callable[[int, str, int], None] | None = None,
+    on_timeout: Callable[[int, float, int], None] | None = None,
+    on_setup_fail: Callable[[int, str], None] | None = None,
+    on_exit: Callable[[], None] | None = None,  # NEW - no parameters
+    base_seed: int = 42,
+    task_timeout: float | None = None,
+    **setup_kwargs,
+) -> None:
+```
+
+Called in finally block:
+
+```python
+finally:
+    if on_exit:
+        on_exit()  # User can do cleanup, save results, etc.
+
+    # Cleanup workers
+    ...
+```
+
+User maintains their own state via closures/class methods, no need to pass stats.
+
+## RichDispatcher Implementation
+
+### API
+
+```python
+from gpu_dispatch.ui import RichDispatcher
+
+dispatcher = RichDispatcher(
+    worker_cls=MyWorker,
+    gpu_ids=[0, 1, 2, 3],
+    queue_size=512,
+    show_ui=True,          # Can disable for logging/non-interactive
+    refresh_rate=2.0,      # UI updates per second
+)
+
+stats = dispatcher.run(
+    generator=my_generator(),
+    on_success=custom_success_handler,  # Optional, receives (task_id, result, worker_id)
+    on_error=custom_error_handler,      # Optional
+    on_timeout=custom_timeout_handler,  # Optional
+    model_path="./model.pth",
+)
+
+# Returns final statistics
+print(f"Completed: {stats['completed']}")
+```
+
+### Internal Architecture
+
+**Composition over inheritance**:
+- Wraps core `Dispatcher`
+- Maintains internal statistics
+- Provides callback wrappers that:
+  1. Update UI state
+  2. Call user's custom callback (if provided)
+
+**Threading**:
+- Main thread: Rich Live display
+- Background thread: Dispatcher.run()
+- Thread-safe state updates with Lock
+
+**State tracking**:
+```python
+self._stats = {
+    'total': 0,
+    'completed': 0,
+    'failed': 0,
+    'timeout': 0,
+    'start_time': None,
+    'gpu_status': {
+        gpu_id: {
+            'status': 'initializing',  # idle, processing, finished, error
+            'current_task': None,
+            'task_start_time': None,
+            'completed': 0,
+            'failed': 0,
+            'timeout': 0,
+        }
+        for gpu_id in gpu_ids
+    }
+}
+```
+
+### UI Components
+
+**Overall Progress Panel**:
+```
+┌─ Overall Progress ───────────────────────────┐
+│ Progress: 847/1000 (✓ 820 ✗ 15 ⏱ 12)       │
+│ Elapsed: 0:12:34 │ ETA: 0:02:15            │
+└──────────────────────────────────────────────┘
+```
+
+**GPU Status Table**:
+```
+┌─ GPU Status ─────────────────────────────────────────────┐
+│ GPU │ Status      │ Current │ Completed │ Failed │ Time │
+├─────┼─────────────┼─────────┼───────────┼────────┼──────┤
+│  0  │ Processing  │  #1523  │    210    │   3    │ 2.1s │
+│  1  │ Processing  │  #1524  │    208    │   4    │ 1.8s │
+│  2  │ Idle        │    -    │    205    │   2    │  -   │
+│  3  │ Processing  │  #1525  │    207    │   6    │ 0.9s │
+└─────┴─────────────┴─────────┴───────────┴────────┴──────┘
+```
+
+**Status colors**:
+- Processing: Yellow
+- Idle: Green
+- Initializing: Blue
+- Finished: Bold Green
+- Error: Bold Red
+
+### GPU Status Detection
+
+Track GPU status transitions:
+- `initializing` → first message from worker
+- `idle` → after completing a task (before getting next)
+- `processing` → when task starts
+- `finished` → when worker exits
+- `error` → when setup fails
+
+Use worker_id from messages to update correct GPU status.
+
+### User Callback Integration
+
+```python
+def _wrap_success_callback(self, user_callback):
+    def wrapper(task_id, result, worker_id):
+        with self._lock:
+            # Update UI state
+            self._stats['completed'] += 1
+            self._stats['gpu_status'][worker_id]['completed'] += 1
+            self._stats['gpu_status'][worker_id]['status'] = 'idle'
+            self._stats['gpu_status'][worker_id]['current_task'] = None
+
+        # Call user callback
+        if user_callback:
+            user_callback(task_id, result, worker_id)
+
+    return wrapper
+```
+
+## Implementation Steps
+
+1. Add type annotations to Dispatcher.run()
+2. Update core protocol (add worker_id)
+3. Update worker._worker_main (pass gpu_id to messages)
+4. Update dispatcher callbacks (add worker_id parameter, add on_exit)
+5. Add rich to dependencies
+6. Implement RichDispatcher
+7. Write examples
+8. Update tests (new callback signatures)
+9. Update design.md
+10. Update README.md
+
+## Examples
+
+### Basic Rich UI
+```python
+from gpu_dispatch.ui import RichDispatcher
+
+dispatcher = RichDispatcher(
+    worker_cls=MyWorker,
+    gpu_ids=[0, 1, 2, 3],
+)
+
+stats = dispatcher.run(
+    generator=data_generator(),
+    model_path="./model.pth",
+)
+```
+
+### With Custom Callbacks
+```python
+results = []
+
+def save_result(task_id, result, worker_id):
+    results.append(result)
+
+def handle_error(task_id, error, worker_id):
+    logging.error(f"Task {task_id} on GPU {worker_id}: {error}")
+
+def on_exit():
+    print(f"Finished! Processed {len(results)} items")
+    save_to_disk(results)
+
+dispatcher = RichDispatcher(
+    worker_cls=MyWorker,
+    gpu_ids=[0, 1, 2, 3],
+)
+
+stats = dispatcher.run(
+    generator=data_generator(),
+    on_success=save_result,
+    on_error=handle_error,
+    on_exit=on_exit,
+    model_path="./model.pth",
+)
+```
+
+### No UI (just statistics)
+```python
+dispatcher = RichDispatcher(
+    worker_cls=MyWorker,
+    gpu_ids=[0, 1, 2, 3],
+    show_ui=False,  # Disable UI, still track stats
+)
+
+stats = dispatcher.run(...)
+print(f"Success rate: {stats['completed']/stats['total']*100:.1f}%")
+```
+
+## Design Decisions
+
+### On-exit callback
+
+Add `on_exit` callback to `Dispatcher.run()`:
+- Called in finally block (guaranteed execution)
+- No parameters - user maintains state themselves via closures
+- Executes on both normal completion and interruption
+- Useful for cleanup, final logging, saving state
+- Reliable because it's in the finally block of dispatcher.run()
